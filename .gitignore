@@ -1,0 +1,6 @@
+src/data/annotated_images/
+src/data/images/
+src/data/2.16-2.52dpa.mp4
+src/__pycache__/
+.DS_Store
+src/.DS_Store
