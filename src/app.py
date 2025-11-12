@@ -72,6 +72,7 @@ def annotate_all_images():
         try:
             # Generate output filename
             output_file = output_dir / f"{image_file.stem}_annotated.png"
+            mask_file = output_dir / f"{image_file.stem}_mask.png"
             
             # Apply annotation
             draw_local_contrast_dark_contours(
@@ -79,10 +80,13 @@ def annotate_all_images():
                 noise=params['noise'],
                 scale=params['scale'],
                 contrast=params['contrast'],
-                out_path=str(output_file)
+                out_path=str(output_file),
+                mask_out_path=str(mask_file),
             )
             
-            print(f"  [{i}/{len(image_files)}] Processed: {image_file.name} -> {output_file.name}")
+            print(
+                f"  [{i}/{len(image_files)}] Processed: {image_file.name} -> {output_file.name}, {mask_file.name}"
+            )
             
         except Exception as e:
             print(f"  Error processing {image_file.name}: {e}")

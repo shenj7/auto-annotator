@@ -2,7 +2,14 @@
 import cv2
 import numpy as np
 
-def draw_local_contrast_dark_contours(image_path, noise=0.45, scale=5.0, contrast=0, out_path="contours.png"):
+def draw_local_contrast_dark_contours(
+    image_path,
+    noise=0.45,
+    scale=5.0,
+    contrast=0,
+    out_path="contours.png",
+    mask_out_path=None,
+):
     g = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 
     # optional pre-smoothing tied to noise to quiet sensor speckle
@@ -33,6 +40,12 @@ def draw_local_contrast_dark_contours(image_path, noise=0.45, scale=5.0, contras
     cv2.drawContours(out, cnts, -1, (0, 255, 0), 1)
     cv2.imwrite(out_path, out)
 
+    if mask_out_path:
+        mask = np.full_like(g, 255)
+        if cnts:
+            cv2.drawContours(mask, cnts, -1, 0, thickness=cv2.FILLED)
+        cv2.imwrite(mask_out_path, mask)
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Outline dark spots using local-contrast thresholding.")
@@ -43,8 +56,18 @@ if __name__ == "__main__":
                     help="Gaussian sigma for neighborhood size in pixels (default: 5.0)")
     ap.add_argument("-c", "--contrast", type=float, default=0,
                     help="local contrast threshold (local_mean - pixel) in 0..255 (default: 0)")
-    ap.add_argument("-o", "--out", default="contours.png",
-                    help="output path (default: contours.png)")
+    ap.add_argument(
+        "-o",
+        "--out",
+        default="contours.png",
+        help="output path (default: contours.png)",
+    )
+    ap.add_argument(
+        "-m",
+        "--mask-out",
+        default=None,
+        help="optional path to write binary mask (white background, black foreground)",
+    )
     args = ap.parse_args()
 
     draw_local_contrast_dark_contours(
@@ -52,5 +75,6 @@ if __name__ == "__main__":
         noise=args.sensitivity,
         scale=args.scale,
         contrast=args.contrast,
-        out_path=args.out
+        out_path=args.out,
+        mask_out_path=args.mask_out,
     )

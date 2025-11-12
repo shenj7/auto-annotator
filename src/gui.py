@@ -18,6 +18,7 @@ class ContourGUI:
         
         self.current_image_path = None
         self.temp_output_path = None
+        self.temp_mask_path = None
         
         # Create main frame
         main_frame = ttk.Frame(root, padding="10")
@@ -105,6 +106,7 @@ class ContourGUI:
         
         # Create temp file for output
         self.temp_output_path = os.path.join(tempfile.gettempdir(), "contour_temp_output.png")
+        self.temp_mask_path = os.path.join(tempfile.gettempdir(), "contour_temp_mask.png")
         
         # Try to load default image if available
         self.load_default_image()
@@ -157,7 +159,8 @@ class ContourGUI:
                 noise=noise,
                 scale=scale,
                 contrast=contrast,
-                out_path=self.temp_output_path
+                out_path=self.temp_output_path,
+                mask_out_path=self.temp_mask_path
             )
             
             # Load and display the result
@@ -268,14 +271,26 @@ class ContourGUI:
             input_path = Path(self.current_image_path)
             base_name = input_path.stem
             output_file = output_dir / f"{base_name}_annotated.png"
+            mask_output_file = output_dir / f"{base_name}_mask.png"
             
             # Copy the annotated image to the output directory
             shutil.copy(self.temp_output_path, str(output_file))
+
+            # Copy the mask image if available
+            mask_saved = False
+            if self.temp_mask_path and os.path.exists(self.temp_mask_path):
+                shutil.copy(self.temp_mask_path, str(mask_output_file))
+                mask_saved = True
             
             # Append settings to CSV
             self.save_settings_to_csv()
             
-            tk.messagebox.showinfo("Success", f"Result saved to {output_file}\nSettings saved to settings.csv")
+            message_lines = [f"Result saved to {output_file}"]
+            if mask_saved:
+                message_lines.append(f"Mask saved to {mask_output_file}")
+            message_lines.append("Settings saved to settings.csv")
+
+            tk.messagebox.showinfo("Success", "\n".join(message_lines))
         except Exception as e:
             tk.messagebox.showerror("Error", f"Failed to save: {e}")
 
