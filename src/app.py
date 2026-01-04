@@ -50,11 +50,14 @@ def annotate_all_images():
     
     # Get input and output directories
     input_dir = script_dir / "data" / "images"
-    output_dir = script_dir / "data" / "auto_images"
+    output_root = script_dir / "data" / "auto_images"
+    annotations_dir = output_root / "annotations"
+    masks_dir = output_root / "masks"
     
     # Create directories if they don't exist
     input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    annotations_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
     
     # Get all image files
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
@@ -71,8 +74,8 @@ def annotate_all_images():
     for i, image_file in enumerate(sorted(image_files), 1):
         try:
             # Generate output filename
-            output_file = output_dir / f"{image_file.stem}_annotated.png"
-            mask_file = output_dir / f"{image_file.stem}_mask.png"
+            output_file = annotations_dir / f"{image_file.stem}_annotated.png"
+            mask_file = masks_dir / f"{image_file.stem}_mask.png"
             
             # Apply annotation
             draw_local_contrast_dark_contours(
@@ -91,7 +94,8 @@ def annotate_all_images():
         except Exception as e:
             print(f"  Error processing {image_file.name}: {e}")
     
-    print(f"\nFinished! Annotated images saved to {output_dir}")
+    print(f"\nFinished! Annotated images saved to {annotations_dir}")
+    print(f"Masks saved to {masks_dir}")
 
 
 def main():
@@ -139,4 +143,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
