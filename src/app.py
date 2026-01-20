@@ -1,6 +1,8 @@
 import argparse
 from pathlib import Path
 import csv
+import math
+import cv2
 from video_utils import extract_frames
 from gui import main as gui_main
 from annotation_utils import draw_local_contrast_dark_contours
@@ -22,10 +24,50 @@ def get_last_parameters_from_csv(settings_file):
         # Get the last row (most recent)
         last_row = rows[-1]
         
+        scale_percent = None
+        if 'scale_percent' in last_row and last_row['scale_percent'] != '':
+            try:
+                scale_percent = float(last_row['scale_percent'])
+            except ValueError:
+                scale_percent = None
+
+        min_radius = None
+        if 'min_radius' in last_row and last_row['min_radius'] != '':
+            try:
+                min_radius = float(last_row['min_radius'])
+            except ValueError:
+                min_radius = None
+
+        max_radius = None
+        if 'max_radius' in last_row and last_row['max_radius'] != '':
+            try:
+                max_radius = float(last_row['max_radius'])
+            except ValueError:
+                max_radius = None
+
+        min_area = None
+        if 'min_area' in last_row and last_row['min_area'] != '':
+            try:
+                min_area = float(last_row['min_area'])
+            except ValueError:
+                min_area = None
+
+        max_area = None
+        if 'max_area' in last_row and last_row['max_area'] != '':
+            try:
+                max_area = float(last_row['max_area'])
+            except ValueError:
+                max_area = None
+
         return {
             'noise': float(last_row['noise']),
             'scale': float(last_row['scale']),
-            'contrast': float(last_row['contrast'])
+            'scale_percent': scale_percent,
+            'contrast': float(last_row['contrast']),
+            'min_radius': min_radius,
+            'max_radius': max_radius,
+            'min_area': min_area,
+            'max_area': max_area,
         }
 
 
@@ -42,8 +84,29 @@ def annotate_all_images():
         params = get_last_parameters_from_csv(settings_file)
         print(f"Using parameters from settings.csv:")
         print(f"  Noise: {params['noise']:.4f}")
-        print(f"  Scale: {params['scale']:.4f}")
+        if params['scale_percent'] is None:
+            print(f"  Scale: {params['scale']:.4f}")
+        else:
+            print(f"  Scale: {params['scale_percent']:.2f}% of image min dimension")
         print(f"  Contrast: {params['contrast']:.4f}")
+        min_radius = params['min_radius']
+        max_radius = params['max_radius']
+        min_area = params['min_area']
+        max_area = params['max_area']
+
+        if min_radius is None and min_area is not None:
+            min_radius = math.sqrt(min_area / math.pi)
+        if max_radius is None and max_area is not None:
+            max_radius = math.sqrt(max_area / math.pi)
+
+        if min_radius is None:
+            print("  Min radius: auto (from noise)")
+        else:
+            print(f"  Min radius: {min_radius:.2f}px")
+        if max_radius is None:
+            print("  Max radius: none")
+        else:
+            print(f"  Max radius: {max_radius:.2f}px")
     except Exception as e:
         print(f"Error reading parameters: {e}")
         return
@@ -76,13 +139,29 @@ def annotate_all_images():
             # Generate output filename
             output_file = annotations_dir / f"{image_file.stem}_annotated.png"
             mask_file = masks_dir / f"{image_file.stem}_mask.png"
-            
+
             # Apply annotation
+            scale = params['scale']
+            if params['scale_percent'] is not None:
+                img = cv2.imread(str(image_file), cv2.IMREAD_GRAYSCALE)
+                if img is not None and img.size > 0:
+                    height, width = img.shape[:2]
+                    scale = min(width, height) * (params['scale_percent'] / 100.0)
+
+            min_area = params['min_area']
+            max_area = params['max_area']
+            if params['min_radius'] is not None:
+                min_area = math.pi * params['min_radius'] * params['min_radius']
+            if params['max_radius'] is not None:
+                max_area = math.pi * params['max_radius'] * params['max_radius']
+
             draw_local_contrast_dark_contours(
                 str(image_file),
                 noise=params['noise'],
-                scale=params['scale'],
+                scale=scale,
                 contrast=params['contrast'],
+                min_area=min_area,
+                max_area=max_area,
                 out_path=str(output_file),
                 mask_out_path=str(mask_file),
             )

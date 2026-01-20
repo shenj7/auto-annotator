@@ -2,8 +2,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 from pathlib import Path
-from annotation_utils import draw_local_contrast_dark_contours
+from annotation_utils import draw_local_contrast_dark_contours, min_area_from_noise
 import tempfile
+import math
 import os
 import csv
 import shutil
@@ -19,6 +20,10 @@ class ContourGUI:
         self.current_image_path = None
         self.temp_output_path = None
         self.temp_mask_path = None
+        self._image_min_dim = None
+        self._radius_min_limit = 1
+        self._radius_max_limit = 5000
+        self._suppress_slider_callback = False
         
         # Create main frame
         main_frame = ttk.Frame(root, padding="10")
@@ -56,15 +61,18 @@ class ContourGUI:
         self.noise_label.pack(anchor=tk.W)
         self.noise_var.trace('w', lambda *args: self.noise_label.config(text=f"{self.noise_var.get():.2f}"))
         
-        # Scale slider (0.0 to 20.0)
-        ttk.Label(params_frame, text="Scale (0.0 - 20.0):").pack(anchor=tk.W, pady=(10, 5))
-        self.scale_var = tk.DoubleVar(value=5.0)
-        scale_scale = ttk.Scale(params_frame, from_=0.0, to=20.0, variable=self.scale_var,
+        # Scale radius percent (0.1% to 2% of image)
+        ttk.Label(params_frame, text="Scale Radius (% of image, 0.1 - 2):").pack(anchor=tk.W, pady=(10, 5))
+        self.scale_percent_var = tk.DoubleVar(value=2.0)
+        scale_scale = ttk.Scale(params_frame, from_=0.1, to=2.0, variable=self.scale_percent_var,
                                orient=tk.HORIZONTAL, command=self.on_slider_change)
         scale_scale.pack(fill=tk.X, pady=(0, 5))
-        self.scale_label = ttk.Label(params_frame, text="5.0")
+        self.scale_label = ttk.Label(params_frame, text="2.00%")
         self.scale_label.pack(anchor=tk.W)
-        self.scale_var.trace('w', lambda *args: self.scale_label.config(text=f"{self.scale_var.get():.2f}"))
+        self.scale_percent_var.trace(
+            'w',
+            lambda *args: self.scale_label.config(text=f"{self.scale_percent_var.get():.2f}%"),
+        )
         
         # Contrast slider (0 to 255)
         ttk.Label(params_frame, text="Contrast (0 - 255):").pack(anchor=tk.W, pady=(10, 5))
@@ -75,7 +83,45 @@ class ContourGUI:
         self.contrast_label = ttk.Label(params_frame, text="0")
         self.contrast_label.pack(anchor=tk.W)
         self.contrast_var.trace('w', lambda *args: self.contrast_label.config(text=f"{int(self.contrast_var.get())}"))
-        
+
+        # Min radius slider (0.01% to 1% of image size)
+        ttk.Label(params_frame, text="Min Radius (pixels, 0.01% - 1% of image):").pack(anchor=tk.W, pady=(10, 5))
+        default_min_area = min_area_from_noise(self.noise_var.get())
+        default_min_radius = math.sqrt(default_min_area / math.pi)
+        self.min_radius_var = tk.DoubleVar(value=float(default_min_radius))
+        self.min_radius_pos_var = tk.DoubleVar(
+            value=self._pos_from_radius(default_min_radius)
+        )
+        self.min_radius_scale = ttk.Scale(
+            params_frame,
+            from_=0.0,
+            to=1.0,
+            variable=self.min_radius_pos_var,
+            orient=tk.HORIZONTAL,
+            command=self._on_min_radius_slider,
+        )
+        self.min_radius_scale.pack(fill=tk.X, pady=(0, 5))
+        self.min_radius_label = ttk.Label(params_frame, text=str(int(default_min_radius)))
+        self.min_radius_label.pack(anchor=tk.W)
+        self.min_radius_var.trace('w', lambda *args: self.min_radius_label.config(text=f"{int(self.min_radius_var.get())}"))
+
+        # Max radius slider (0.01% to 1% of image size)
+        ttk.Label(params_frame, text="Max Radius (pixels, 0.01% - 1% of image):").pack(anchor=tk.W, pady=(10, 5))
+        self.max_radius_var = tk.DoubleVar(value=float(self._radius_max_limit))
+        self.max_radius_pos_var = tk.DoubleVar(value=1.0)
+        self.max_radius_scale = ttk.Scale(
+            params_frame,
+            from_=0.0,
+            to=1.0,
+            variable=self.max_radius_pos_var,
+            orient=tk.HORIZONTAL,
+            command=self._on_max_radius_slider,
+        )
+        self.max_radius_scale.pack(fill=tk.X, pady=(0, 5))
+        self.max_radius_label = ttk.Label(params_frame, text=str(int(self._radius_max_limit)))
+        self.max_radius_label.pack(anchor=tk.W)
+        self.max_radius_var.trace('w', lambda *args: self.max_radius_label.config(text=f"{int(self.max_radius_var.get())}"))
+
         # Save button
         save_frame = ttk.Frame(control_frame)
         save_frame.pack(fill=tk.X, pady=(20, 0))
@@ -118,6 +164,7 @@ class ContourGUI:
         if default_image.exists():
             self.current_image_path = str(default_image)
             self.image_label.config(text=os.path.basename(self.current_image_path), foreground="black")
+            self._update_radius_limits()
             self.update_image()
     
     def select_image(self):
@@ -135,12 +182,103 @@ class ContourGUI:
         if file_path:
             self.current_image_path = file_path
             self.image_label.config(text=os.path.basename(file_path), foreground="black")
+            self._update_radius_limits()
             self.update_image()
     
     def on_slider_change(self, *args):
         """Called when any slider changes"""
+        if self._suppress_slider_callback:
+            return
+        self._enforce_radius_bounds()
         if self.current_image_path:
             self.update_image()
+
+    def _radius_limits_from_image(self):
+        if not self.current_image_path:
+            return None
+        try:
+            with Image.open(self.current_image_path) as img:
+                width, height = img.size
+        except Exception as e:
+            print(f"Error reading image size: {e}")
+            return None
+        base = min(width, height)
+        self._image_min_dim = base
+        min_limit = max(1, int(round(base * 0.0001)))
+        max_limit = max(min_limit, int(round(base * 0.01)))
+        return min_limit, max_limit
+
+    def _pos_from_radius(self, radius):
+        min_val = float(self._radius_min_limit)
+        max_val = float(self._radius_max_limit)
+        if max_val <= min_val:
+            return 0.0
+        if radius <= 0:
+            return 0.0
+        radius = max(min_val, min(radius, max_val))
+        return math.log(radius / min_val) / math.log(max_val / min_val)
+
+    def _radius_from_pos(self, pos):
+        min_val = float(self._radius_min_limit)
+        max_val = float(self._radius_max_limit)
+        if max_val <= min_val:
+            return min_val
+        pos = max(0.0, min(1.0, pos))
+        return min_val * ((max_val / min_val) ** pos)
+
+    def _update_radius_limits(self):
+        limits = self._radius_limits_from_image()
+        if limits is None:
+            return
+        previous_min = self._radius_min_limit
+        previous_max = self._radius_max_limit
+        self._radius_min_limit, self._radius_max_limit = limits
+        self.min_radius_scale.configure(from_=0.0, to=1.0)
+        self.max_radius_scale.configure(from_=0.0, to=1.0)
+        if int(round(self.min_radius_var.get())) == previous_min:
+            self.min_radius_var.set(float(self._radius_min_limit))
+        if int(round(self.max_radius_var.get())) == previous_max:
+            self.max_radius_var.set(float(self._radius_max_limit))
+        self._enforce_radius_bounds()
+
+    def _enforce_radius_bounds(self):
+        min_val = self.min_radius_var.get()
+        max_val = self.max_radius_var.get()
+        min_val = max(float(self._radius_min_limit), min(min_val, float(self._radius_max_limit)))
+        max_val = max(float(self._radius_min_limit), min(max_val, float(self._radius_max_limit)))
+        if max_val < min_val:
+            max_val = min_val
+        self._suppress_slider_callback = True
+        self.min_radius_var.set(min_val)
+        self.max_radius_var.set(max_val)
+        self.min_radius_pos_var.set(self._pos_from_radius(min_val))
+        self.max_radius_pos_var.set(self._pos_from_radius(max_val))
+        self._suppress_slider_callback = False
+
+    def _on_min_radius_slider(self, *args):
+        if self._suppress_slider_callback:
+            return
+        self.min_radius_var.set(self._radius_from_pos(self.min_radius_pos_var.get()))
+        self._enforce_radius_bounds()
+        if self.current_image_path:
+            self.update_image()
+
+    def _on_max_radius_slider(self, *args):
+        if self._suppress_slider_callback:
+            return
+        self.max_radius_var.set(self._radius_from_pos(self.max_radius_pos_var.get()))
+        self._enforce_radius_bounds()
+        if self.current_image_path:
+            self.update_image()
+
+    def _scale_pixels_from_percent(self, percent):
+        min_dim = self._image_min_dim
+        if min_dim is None:
+            self._radius_limits_from_image()
+            min_dim = self._image_min_dim
+        if min_dim is None:
+            return None
+        return float(min_dim) * (percent / 100.0)
     
     def update_image(self):
         """Update the displayed image with current parameters"""
@@ -150,8 +288,15 @@ class ContourGUI:
         try:
             # Get current parameter values
             noise = self.noise_var.get()
-            scale = self.scale_var.get()
+            scale_percent = self.scale_percent_var.get()
+            scale = self._scale_pixels_from_percent(scale_percent)
+            if scale is None:
+                scale = 1.0
             contrast = self.contrast_var.get()
+            min_radius = self.min_radius_var.get()
+            max_radius = self.max_radius_var.get()
+            min_area = math.pi * min_radius * min_radius
+            max_area = math.pi * max_radius * max_radius
             
             # Call the contour function
             draw_local_contrast_dark_contours(
@@ -159,6 +304,8 @@ class ContourGUI:
                 noise=noise,
                 scale=scale,
                 contrast=contrast,
+                min_area=min_area,
+                max_area=max_area,
                 out_path=self.temp_output_path,
                 mask_out_path=self.temp_mask_path
             )
@@ -206,36 +353,91 @@ class ContourGUI:
         
         # Get current parameter values
         noise = self.noise_var.get()
-        scale = self.scale_var.get()
+        scale_percent = self.scale_percent_var.get()
+        scale = self._scale_pixels_from_percent(scale_percent)
+        if scale is None:
+            scale = 1.0
         contrast = self.contrast_var.get()
-        
-        # Check if file exists and has headers
-        file_exists = settings_file.exists()
-        has_headers = False
-        
-        if file_exists:
+        min_radius = float(self.min_radius_var.get())
+        max_radius = float(self.max_radius_var.get())
+
+        fieldnames = [
+            'image_path',
+            'noise',
+            'scale',
+            'scale_percent',
+            'contrast',
+            'min_radius',
+            'max_radius',
+            'timestamp',
+        ]
+        existing_fieldnames = None
+
+        if settings_file.exists():
             try:
                 with open(settings_file, 'r', newline='') as f:
                     reader = csv.reader(f)
-                    first_line = next(reader, None)
-                    has_headers = first_line is not None and first_line[0].lower() == 'image_path'
-            except:
-                pass
-        
-        # Write headers if file doesn't exist or doesn't have headers
-        write_headers = not file_exists or not has_headers
-        
+                    existing_fieldnames = next(reader, None)
+            except Exception:
+                existing_fieldnames = None
+
+        if existing_fieldnames and existing_fieldnames != fieldnames:
+            try:
+                with open(settings_file, 'r', newline='') as f:
+                    dict_reader = csv.DictReader(f)
+                    existing_rows = list(dict_reader)
+                for row in existing_rows:
+                    if not row.get('min_radius'):
+                        min_area_value = row.get('min_area', '')
+                        if min_area_value:
+                            try:
+                                area = float(min_area_value)
+                                row['min_radius'] = f"{math.sqrt(area / math.pi):.2f}"
+                            except ValueError:
+                                row['min_radius'] = ''
+                        else:
+                            noise_value = row.get('noise', '')
+                            if noise_value:
+                                try:
+                                    area = min_area_from_noise(float(noise_value))
+                                    row['min_radius'] = f"{math.sqrt(area / math.pi):.2f}"
+                                except ValueError:
+                                    row['min_radius'] = ''
+                            else:
+                                row['min_radius'] = ''
+                    if not row.get('max_radius'):
+                        max_area_value = row.get('max_area', '')
+                        if max_area_value:
+                            try:
+                                area = float(max_area_value)
+                                row['max_radius'] = f"{math.sqrt(area / math.pi):.2f}"
+                            except ValueError:
+                                row['max_radius'] = ''
+                        else:
+                            row['max_radius'] = ''
+                    if not row.get('scale_percent'):
+                        row['scale_percent'] = ''
+                with open(settings_file, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
+                existing_fieldnames = fieldnames
+            except Exception as e:
+                print(f"Error migrating settings.csv: {e}")
+                existing_fieldnames = None
+
+        write_headers = not settings_file.exists() or not existing_fieldnames
+
         try:
             with open(settings_file, 'a', newline='') as f:
                 writer = csv.writer(f)
-                
-                # Write headers if needed
+
                 if write_headers:
-                    writer.writerow(['image_path', 'noise', 'scale', 'contrast', 'timestamp'])
-                
+                    writer.writerow(fieldnames)
+
                 # Write current settings
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                
+
                 # Convert absolute path to relative path from project root
                 if self.current_image_path:
                     try:
@@ -247,9 +449,18 @@ class ContourGUI:
                         image_path = self.current_image_path
                 else:
                     image_path = ''
-                
-                writer.writerow([image_path, f"{noise:.4f}", f"{scale:.4f}", f"{contrast:.4f}", timestamp])
-                
+
+                writer.writerow([
+                    image_path,
+                    f"{noise:.4f}",
+                    f"{scale:.4f}",
+                    f"{scale_percent:.2f}",
+                    f"{contrast:.4f}",
+                    f"{min_radius:.2f}",
+                    f"{max_radius:.2f}",
+                    timestamp,
+                ])
+
         except Exception as e:
             print(f"Error saving settings to CSV: {e}")
     
@@ -303,4 +514,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
