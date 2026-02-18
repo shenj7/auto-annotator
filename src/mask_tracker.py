@@ -99,6 +99,7 @@ def _find_components(
                 "centroid": (cx, cy),
                 "bbox": (int(x), int(y), int(w), int(h)),
                 "area": area,
+                "contour": cnt,
             }
         )
 

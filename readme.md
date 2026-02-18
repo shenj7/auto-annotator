@@ -11,3 +11,7 @@ How to use:
 3. Run the GUI with python src/app.py --gui
 4. When you're happy with your parameters, run python src/app.py --annotate to annotate the rest of the images with your last used parameters. Annotated images and companion masks (white background, black foreground) are written to `src/data/auto_images/annotations` and `src/data/auto_images/masks` respectively.
 5. Get colorized images and tracks with python3 src/mask_tracker.py --mask-dir src/data/auto_images/masks --out-dir src/data/auto_images/masks/tracking
+
+Tracking individual blobs:
+1. Run the GUI with python src/mask_blob_tracker_gui.py
+2. Left-click a blob to track. Use left/right arrow keys to move frames. q quits.
