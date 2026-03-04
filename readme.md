@@ -14,4 +14,5 @@ How to use:
 
 Tracking individual blobs:
 1. Run the GUI with python src/mask_blob_tracker_gui.py
-2. Left-click a blob to track. Use left/right arrow keys to move frames. q quits.
+2. Press g to set grain boundaries, edit the grain_boundaries.json file to edit.
+3. Left-click a blob to track. Use left/right arrow keys to move frames. q quits.

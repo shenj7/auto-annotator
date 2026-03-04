@@ -1,12 +1,14 @@
-#!/usr/bin/env python3
 import argparse
 import csv
+import json
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from geometry_utils import min_dist_to_grain_boundaries
 
 
 MIN_AREA = 5
@@ -38,6 +40,11 @@ class MaskBlobTrackerGUI:
         self.current_pos = 0
         self.tracks: Dict[int, Dict] = {}
         self.next_track_id = 1
+
+        self.grain_boundaries: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        self.gb_mode = False
+        self.current_gb_start: Optional[Tuple[int, int]] = None
+        self._load_grain_boundaries()
 
         self._mask_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self._component_cache: "OrderedDict[int, List[Dict]]" = OrderedDict()
@@ -142,16 +149,26 @@ class MaskBlobTrackerGUI:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
+        if self.gb_mode:
+            if self.current_gb_start is None:
+                self.current_gb_start = (x, y)
+            else:
+                self.grain_boundaries.append((self.current_gb_start, (x, y)))
+                self.current_gb_start = None
+                self._save_grain_boundaries()
+            return
+
         pos = self.current_pos
         components = self._get_components(pos)
         if not components:
             return
 
-        for track in self.tracks.values():
+        for track_id, track in list(self.tracks.items()):
             contour = track["contours"].get(pos)
             if contour is None:
                 continue
             if cv2.pointPolygonTest(contour, (x, y), False) >= 0:
+                del self.tracks[track_id]
                 return
 
         for comp in components:
@@ -281,20 +298,34 @@ class MaskBlobTrackerGUI:
                     cv2.LINE_AA,
                 )
 
+    def _draw_grain_boundaries(self, image: np.ndarray) -> None:
+        for start, end in self.grain_boundaries:
+            p1 = (int(start[0]), int(start[1]))
+            p2 = (int(end[0]), int(end[1]))
+            cv2.line(image, p1, p2, (0, 0, 255), 2, cv2.LINE_AA)
+        
+        if self.current_gb_start:
+            # Drawing current line preview is hard with current waitKey loop 
+            # but we can at least show the start point
+            cv2.circle(image, self.current_gb_start, 4, (0, 255, 255), -1)
+
     def _render(self) -> None:
         self._ensure_tracks(self.current_pos)
 
         mask = self._get_mask(self.current_pos)
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         self._draw_tracks(mask_bgr, self.current_pos, draw_paths=True)
+        self._draw_grain_boundaries(mask_bgr)
 
         frame_num = self.frame_numbers[self.current_pos]
         label = f"Frame {self.current_pos + 1}/{len(self.mask_paths)} (id {frame_num})"
         self._draw_label(mask_bgr, label, (10, 22))
-        self._draw_label(mask_bgr, "LMB select  |  Left/Right: frame  |  q: quit", (10, 44))
+        mode_str = "GB MODE" if self.gb_mode else "TRACK MODE"
+        self._draw_label(mask_bgr, f"{mode_str} | g: toggle GB | c: clear GB | q: quit", (10, 44))
 
         image = self._get_image(self.current_pos, mask.shape)
         self._draw_tracks(image, self.current_pos, draw_paths=False)
+        self._draw_grain_boundaries(image)
         self._draw_label(image, label, (10, 22))
 
         composite = np.hstack([mask_bgr, image])
@@ -314,12 +345,36 @@ class MaskBlobTrackerGUI:
             key = cv2.waitKey(30) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if key == 81:
+            elif key == ord("g"):
+                self.gb_mode = not self.gb_mode
+                self.current_gb_start = None
+            elif key == ord("c"):
+                self.grain_boundaries.clear()
+                self._save_grain_boundaries()
+            elif key == 81:
                 self._step(-1)
             elif key == 83:
                 self._step(1)
 
         cv2.destroyAllWindows()
+
+    def _save_grain_boundaries(self) -> None:
+        gb_path = self.mask_dir / "grain_boundaries.json"
+        try:
+            with open(gb_path, "w") as f:
+                json.dump(self.grain_boundaries, f)
+        except Exception as e:
+            print(f"Error saving grain boundaries: {e}")
+
+    def _load_grain_boundaries(self) -> None:
+        gb_path = self.mask_dir / "grain_boundaries.json"
+        if gb_path.exists():
+            try:
+                with open(gb_path, "r") as f:
+                    data = json.load(f)
+                    self.grain_boundaries = [((p1[0], p1[1]), (p2[0], p2[1])) for p1, p2 in data]
+            except Exception as e:
+                print(f"Error loading grain boundaries: {e}")
 
     def write_summary_csv(self, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,6 +382,7 @@ class MaskBlobTrackerGUI:
             "track_id",
             "blob_size_px",
             "distance_px",
+            "dist_to_gb_px",
             "lifespan_frames",
         ]
         rows: List[Dict[str, float]] = []
@@ -339,10 +395,17 @@ class MaskBlobTrackerGUI:
                 continue
 
             distance = 0.0
-            for idx in range(1, len(positions)):
-                x0, y0 = positions[idx - 1]
-                x1, y1 = positions[idx]
-                distance += float(np.hypot(x1 - x0, y1 - y0))
+            gb_distances = []
+            for idx in range(len(positions)):
+                p = positions[idx]
+                gb_distances.append(min_dist_to_grain_boundaries(p, self.grain_boundaries))
+                
+                if idx > 0:
+                    x0, y0 = positions[idx - 1]
+                    x1, y1 = positions[idx]
+                    distance += float(np.hypot(x1 - x0, y1 - y0))
+
+            mean_gb_dist = float(np.nanmean(gb_distances)) if gb_distances else 0.0
 
             areas = []
             for contour in track["contours"].values():
@@ -356,6 +419,7 @@ class MaskBlobTrackerGUI:
                     "track_id": int(track["id"]),
                     "blob_size_px": blob_size,
                     "distance_px": distance,
+                    "dist_to_gb_px": mean_gb_dist,
                     "lifespan_frames": int(len(positions)),
                 }
             )
@@ -367,12 +431,45 @@ class MaskBlobTrackerGUI:
 
         print(f"Wrote track summary to {output_path}")
 
+    def write_detailed_csv(self, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "track_id",
+            "frame",
+            "centroid_x",
+            "centroid_y",
+            "dist_to_gb_px",
+        ]
+        
+        rows: List[Dict] = []
+        for track_id, track in self.tracks.items():
+            for pos in sorted(track["positions"].keys()):
+                p = track["positions"][pos]
+                frame_idx = self.frame_numbers[pos]
+                dist = min_dist_to_grain_boundaries(p, self.grain_boundaries)
+                
+                rows.append({
+                    "track_id": track_id,
+                    "frame": frame_idx,
+                    "centroid_x": p[0],
+                    "centroid_y": p[1],
+                    "dist_to_gb_px": dist,
+                })
+
+        with output_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"Wrote detailed tracks to {output_path}")
+
 
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
     default_mask_dir = script_dir / "data" / "auto_images" / "masks"
     default_image_dir = script_dir / "data" / "images"
-    default_csv = default_mask_dir / "selected_blob_tracks.csv"
+    default_summary_csv = default_mask_dir / "selected_blob_tracks.csv"
+    default_detailed_csv = default_mask_dir / "detailed_blob_tracks.csv"
 
     parser = argparse.ArgumentParser(
         description="Select and track blobs from mask frames with image overlay."
@@ -390,16 +487,23 @@ def main() -> None:
         help="Directory with corresponding images (default: src/data/images).",
     )
     parser.add_argument(
-        "--out-csv",
+        "--out-summary-csv",
         type=Path,
-        default=default_csv,
-        help="CSV path for track summary (default: src/data/auto_images/masks/selected_blob_tracks.csv).",
+        default=default_summary_csv,
+        help="CSV path for track summary (default: .../selected_blob_tracks.csv).",
+    )
+    parser.add_argument(
+        "--out-detailed-csv",
+        type=Path,
+        default=default_detailed_csv,
+        help="CSV path for detailed tracks (default: .../detailed_blob_tracks.csv).",
     )
     args = parser.parse_args()
 
     gui = MaskBlobTrackerGUI(mask_dir=args.mask_dir, image_dir=args.image_dir)
     gui.run()
-    gui.write_summary_csv(args.out_csv)
+    gui.write_summary_csv(args.out_summary_csv)
+    gui.write_detailed_csv(args.out_detailed_csv)
 
 
 if __name__ == "__main__":

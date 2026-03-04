@@ -1,12 +1,14 @@
-#!/usr/bin/env python3
 import argparse
 import csv
+import json
 from math import pi
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
+
+from geometry_utils import min_dist_to_grain_boundaries, point_to_line_segment_dist
 
 
 MIN_AREA = 5
@@ -229,6 +231,7 @@ def _summarize_loops(frame_idx: int, detections: List[Dict]) -> Dict[str, float]
 def process_masks(
     mask_dir: Path,
     output_dir: Path,
+    grain_boundaries: List[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
 ) -> None:
     mask_paths = sorted(mask_dir.glob("*_mask.png"))
     if not mask_paths:
@@ -269,6 +272,11 @@ def process_masks(
         cv2.imwrite(str(color_dir / out_name.replace("_tracked", "_color")), colorized)
 
         for det in detections:
+            gb_dist = (
+                min_dist_to_grain_boundaries(det["centroid"], grain_boundaries)
+                if grain_boundaries
+                else float("nan")
+            )
             csv_rows.append(
                 {
                     "frame": frame_idx,
@@ -280,6 +288,7 @@ def process_masks(
                     "bbox_h": det["bbox"][3],
                     "centroid_x": det["centroid"][0],
                     "centroid_y": det["centroid"][1],
+                    "dist_to_gb_px": gb_dist,
                 }
             )
         loop_writer.writerow(_summarize_loops(frame_idx, detections))
@@ -299,6 +308,7 @@ def process_masks(
                 "bbox_h",
                 "centroid_x",
                 "centroid_y",
+                "dist_to_gb_px",
             ],
         )
         writer.writeheader()
@@ -329,11 +339,32 @@ def main() -> None:
         default=default_out_dir,
         help="Directory to write colorized frames and tracks.csv (default: src/data/auto_images/tracking)",
     )
+    parser.add_argument(
+        "--gb-path",
+        type=Path,
+        default=None,
+        help="Path to grain_boundaries.json",
+    )
     args = parser.parse_args()
+
+    gb_path = args.gb_path
+    if gb_path is None:
+        gb_path = args.mask_dir / "grain_boundaries.json"
+
+    grain_boundaries = []
+    if gb_path.exists():
+        try:
+            with open(gb_path, "r") as f:
+                data = json.load(f)
+                grain_boundaries = [((p[0][0], p[0][1]), (p[1][0], p[1][1])) for p in data]
+            print(f"Loaded {len(grain_boundaries)} grain boundaries from {gb_path}")
+        except Exception as e:
+            print(f"Error loading grain boundaries: {e}")
 
     process_masks(
         mask_dir=args.mask_dir,
         output_dir=args.out_dir,
+        grain_boundaries=grain_boundaries,
     )
 
 
