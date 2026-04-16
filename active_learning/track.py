@@ -2,36 +2,46 @@
 track.py — Run the trained model over a sequence of TEM images, produce masks,
 track dislocations across frames, and output statistics.
 
+Tracking design:
+  - Centroids and equivalent diameters are computed from the binary mask via
+    skimage regionprops (NOT predicted by the U-Net).  The mask encodes full
+    spatial extent so regionprops centroids are more accurate than any point
+    prediction head, and equivalent_diameter falls out for free.
+
+  - Diameter gate: a detection can only be matched to a track whose last
+    known (or predicted) centroid is within one diameter of the detection.
+    Cost = distance / diameter; gate threshold = 1.0.  This prevents the
+    "long jump" problem when two dislocations are close together.
+
+  - Candidate → Confirmed: a track must be associated for 5 consecutive
+    frames before it appears in output.  Suppresses single-frame flicker.
+
+  - Grace period (3 frames): a missed track is kept alive with its last
+    known velocity extrapolated forward.  Handles brief false negatives.
+
+  - Graveyard (40 frames): after the grace period expires the track is
+    moved to a graveyard and can still be revived if a detection reappears
+    within its diameter gate.  Handles longer contrast dropouts.
+
 Usage:
-    python active_learning/track.py --image-dir src/data/images/
-
-    # With optional grain boundaries and custom output dir:
-    python active_learning/track.py \\
-        --image-dir src/data/images/ \\
-        --out-dir   results/tracking/ \\
-        --gb-path   grain_boundaries.json \\
-        --threshold 0.5
-
-Outputs (written to --out-dir):
-    masks/          — binary mask PNG for each frame
-    overlays/       — original image + green contours overlay
-    tracks/         — coloured blobs with track IDs and trajectory lines
-    colorized/      — coloured blobs only (no labels)
-    tracks.csv      — per-detection table (frame, track_id, area, centroid, ...)
-    loop_stats.csv  — per-frame aggregate (loop count, mean size, mean diameter)
+    python active_learning/track.py
+    python active_learning/track.py --image-dir active_learning_data/raw_data/ --threshold 0.4 --out-dir results/
 """
 
 import argparse
 import csv
 import json
 import sys
-from math import pi
+from dataclasses import dataclass, field
+from math import pi, sqrt
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
+from scipy.optimize import linear_sum_assignment
+from skimage.measure import label as sk_label, regionprops
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -40,25 +50,22 @@ from patch_utils import extract_patches, merge_patches
 from geometry_utils import min_dist_to_grain_boundaries
 
 # ---------------------------------------------------------------------------
-# Constants (match src/mask_tracker.py defaults)
+# Constants
 # ---------------------------------------------------------------------------
 
 PATCH_SIZE      = 128
 CHECKPOINT_PATH = Path("active_learning_data/checkpoints/model.pt")
+IMAGE_EXTS      = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-MIN_AREA       = 5
-MAX_DISTANCE   = 8.0    # per-frame matching radius (px) — dislocations barely move
-MIN_ROUNDNESS  = 0.6
-MAX_AGE        = 15     # frames before an active track is moved to graveyard
-GRAVEYARD_AGE  = 40     # frames a dead track stays revivable in the graveyard
-BG_DILATE_ITER = 3
-FG_THRESH_REL  = 0.35   # fraction of max distance-transform value
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+MIN_AREA        = 5      # pixels — smaller regions ignored
+MIN_ROUNDNESS   = 0.5    # 4πA/p² filter before tracking
+CONFIRM_AGE     = 5      # consecutive hits before a track is "confirmed"
+GRACE_PERIOD    = 3      # invisible frames before a track leaves active pool
+GRAVEYARD_AGE   = 40     # frames a dead track stays revivable
 
 
 # ---------------------------------------------------------------------------
-# Model loading + inference
+# Model loading + patch inference  (unchanged)
 # ---------------------------------------------------------------------------
 
 def load_model(device: str) -> ResAttentionUNet:
@@ -82,20 +89,11 @@ def predict_mask(
     threshold: float = 0.5,
     n_passes: int = 1,
 ) -> np.ndarray:
-    """
-    Run the model on a full image (patch → stitch) and return a uint8 binary
-    mask (255 = dislocation, 0 = background).
-
-    n_passes=1 is fastest; increase for smoother probability maps at the cost
-    of inference time.
-    """
-    h, w = img_gray.shape
-    patches = extract_patches(
-        img_gray,
-        patch_size=(PATCH_SIZE, PATCH_SIZE),
-        stride=(PATCH_SIZE, PATCH_SIZE),
-    )
-
+    """Patch → stitch → threshold.  Returns uint8 binary mask (255 = dislocation)."""
+    h, w    = img_gray.shape
+    patches = extract_patches(img_gray,
+                              patch_size=(PATCH_SIZE, PATCH_SIZE),
+                              stride=(PATCH_SIZE, PATCH_SIZE))
     model.eval()
     if n_passes > 1:
         model.enable_dropout()
@@ -103,21 +101,348 @@ def predict_mask(
     prob_patches = []
     with torch.no_grad():
         for patch_img, x, y in patches:
-            tensor = (torch.from_numpy(patch_img).float().unsqueeze(0).unsqueeze(0) / 255.0
-                      ).to(device)
-            preds = []
-            for _ in range(n_passes):
-                preds.append(torch.sigmoid(model(tensor)))
+            t = (torch.from_numpy(patch_img).float()
+                 .unsqueeze(0).unsqueeze(0) / 255.0).to(device)
+            preds = [torch.sigmoid(model(t)) for _ in range(n_passes)]
             mean_p = torch.stack(preds).mean(dim=0).squeeze().cpu().numpy()
             prob_patches.append((mean_p, x, y))
 
     prob_map = merge_patches(prob_patches, (h, w)).astype(np.float32)
-    binary   = (prob_map >= threshold).astype(np.uint8) * 255
-    return binary
+    return (prob_map >= threshold).astype(np.uint8) * 255
 
 
 # ---------------------------------------------------------------------------
-# Component detection (watershed — copied from src/mask_tracker.py)
+# CentroidExtractor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Detection:
+    label:    int
+    x:        float          # centroid column
+    y:        float          # centroid row
+    diameter: float          # equivalent circle diameter (px)
+    area:     int
+    bbox:     Tuple[int, int, int, int]   # row, col, h, w  (skimage convention)
+    contour:  np.ndarray
+
+
+class CentroidExtractor:
+    """
+    Extract dislocation centroids and equivalent diameters from a binary mask.
+
+    Uses skimage.measure.label + regionprops so that centroid is computed from
+    the actual pixel region (moment-based) and equivalent_diameter = 2√(A/π)
+    is available directly — both needed for the diameter gate.
+    """
+
+    def __init__(self, min_area: int = MIN_AREA, min_roundness: float = MIN_ROUNDNESS):
+        self.min_area      = min_area
+        self.min_roundness = min_roundness
+
+    def extract(self, mask: np.ndarray) -> Tuple[List[Detection], np.ndarray]:
+        """
+        Args:
+            mask: uint8 binary mask (255 = foreground).
+        Returns:
+            detections: list of Detection objects.
+            label_map:  int32 array where each blob has a unique integer label.
+        """
+        binary    = (mask > 128).astype(np.uint8)
+        label_map = sk_label(binary, connectivity=2).astype(np.int32)
+        props     = regionprops(label_map)
+
+        detections: List[Detection] = []
+        for prop in props:
+            area = prop.area
+            if area < self.min_area:
+                continue
+
+            # Roundness filter using perimeter from skimage
+            perim = prop.perimeter
+            if perim > 0:
+                roundness = 4.0 * pi * area / (perim * perim)
+                if roundness < self.min_roundness:
+                    continue
+
+            # regionprops centroid is (row, col)
+            cy, cx = prop.centroid
+            diam   = prop.equivalent_diameter_area  # 2 * sqrt(area / pi)
+
+            # Get contour for visualisation
+            blob_mask = (label_map == prop.label).astype(np.uint8)
+            cnts, _   = cv2.findContours(blob_mask, cv2.RETR_EXTERNAL,
+                                          cv2.CHAIN_APPROX_SIMPLE)
+            contour = max(cnts, key=cv2.contourArea) if cnts else np.array([])
+
+            # bbox: (min_row, min_col, max_row, max_col) → convert to (x, y, w, h)
+            r0, c0, r1, c1 = prop.bbox
+            detections.append(Detection(
+                label    = int(prop.label),
+                x        = float(cx),
+                y        = float(cy),
+                diameter = float(diam),
+                area     = int(area),
+                bbox     = (int(c0), int(r0), int(c1 - c0), int(r1 - r0)),
+                contour  = contour,
+            ))
+
+        return detections, label_map
+
+
+# ---------------------------------------------------------------------------
+# Track
+# ---------------------------------------------------------------------------
+
+CANDIDATE = "candidate"
+CONFIRMED = "confirmed"
+
+
+class Track:
+    """State for a single dislocation track."""
+
+    def __init__(self, track_id: int, det: Detection, frame_idx: int):
+        self.track_id         = track_id
+        self.status           = CANDIDATE
+        self.consecutive_hits = 1
+        self.invisible_count  = 0
+        self.diameter         = det.diameter    # updated on each match
+        self._pos             = (det.x, det.y)
+        self._velocity        = (0.0, 0.0)      # px/frame, updated after ≥2 hits
+        # history: (frame_idx, x, y, vx, vy)
+        self.history: List[Tuple] = [(frame_idx, det.x, det.y, 0.0, 0.0)]
+
+    def predict_pos(self) -> Tuple[float, float]:
+        """Extrapolate one frame forward using last known velocity."""
+        return (self._pos[0] + self._velocity[0],
+                self._pos[1] + self._velocity[1])
+
+    def update(self, det: Detection, frame_idx: int) -> None:
+        """Record a matched detection."""
+        prev_x, prev_y = self._pos
+        vx = det.x - prev_x
+        vy = det.y - prev_y
+        self._pos             = (det.x, det.y)
+        self._velocity        = (vx, vy)
+        self.diameter         = det.diameter
+        self.invisible_count  = 0
+        self.consecutive_hits += 1
+        if self.status == CANDIDATE and self.consecutive_hits >= CONFIRM_AGE:
+            self.status = CONFIRMED
+        self.history.append((frame_idx, det.x, det.y, vx, vy))
+
+    def mark_invisible(self) -> None:
+        """Advance one frame without a detection; extrapolate position."""
+        px, py        = self.predict_pos()
+        self._pos     = (px, py)
+        # velocity decays slightly so prediction doesn't drift far
+        self._velocity = (self._velocity[0] * 0.5, self._velocity[1] * 0.5)
+        self.invisible_count  += 1
+        self.consecutive_hits  = 0   # reset confirmation streak
+
+
+# ---------------------------------------------------------------------------
+# VideoTracker
+# ---------------------------------------------------------------------------
+
+class VideoTracker:
+    """
+    Spatio-temporal tracker using a diameter-gated Hungarian cost matrix.
+
+    Matching stages (per frame):
+      1. Active tracks  ← new detections  (diameter-gated)
+      2. Graveyard      ← remaining unmatched detections  (diameter-gated revival)
+      3. Remaining unmatched detections → new Candidate tracks
+      4. Unmatched active tracks → mark_invisible or move to graveyard
+      5. Expired graveyard entries purged
+    """
+
+    def __init__(
+        self,
+        confirm_age:   int = CONFIRM_AGE,
+        grace_period:  int = GRACE_PERIOD,
+        graveyard_age: int = GRAVEYARD_AGE,
+    ):
+        self.confirm_age   = confirm_age
+        self.grace_period  = grace_period
+        self.graveyard_age = graveyard_age
+
+        self.active:              Dict[int, Track] = {}
+        self.graveyard:           Dict[int, Track] = {}
+        self.graveyard_last_seen: Dict[int, int]   = {}
+        self.next_id = 1
+
+        # All confirmed records accumulated across frames
+        self._records: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update(
+        self,
+        detections: List[Detection],
+        frame_idx:  int,
+        grain_boundaries: Optional[List] = None,
+    ) -> Tuple[List[Detection], List[Dict]]:
+        """
+        Process one frame.
+
+        Returns:
+            confirmed_dets:  Detection objects for confirmed tracks only
+                             (for visualisation).
+            new_records:     CSV-ready dicts added this frame.
+        """
+        unmatched_det_indices = set(range(len(detections)))
+
+        # --- Stage 1: match to active tracks ---
+        if self.active and detections:
+            matches, unmatched_det_indices = self._hungarian_match(
+                detections, unmatched_det_indices, self.active
+            )
+            matched_track_ids = set()
+            for det_idx, tid in matches.items():
+                self.active[tid].update(detections[det_idx], frame_idx)
+                matched_track_ids.add(tid)
+
+            # Age out unmatched active tracks
+            for tid in list(self.active.keys()):
+                if tid not in matched_track_ids:
+                    track = self.active[tid]
+                    track.mark_invisible()
+                    if track.invisible_count > self.grace_period:
+                        self.graveyard[tid]           = self.active.pop(tid)
+                        self.graveyard_last_seen[tid] = frame_idx
+
+        # --- Stage 2: try to revive graveyard tracks ---
+        if unmatched_det_indices and self.graveyard:
+            gy_matches, unmatched_det_indices = self._hungarian_match(
+                detections, unmatched_det_indices, self.graveyard
+            )
+            for det_idx, tid in gy_matches.items():
+                track = self.graveyard.pop(tid)
+                self.graveyard_last_seen.pop(tid, None)
+                track.update(detections[det_idx], frame_idx)
+                # Reset invisible state on revival
+                track.invisible_count = 0
+                self.active[tid] = track
+
+        # --- Stage 3: new candidates for unmatched detections ---
+        for det_idx in unmatched_det_indices:
+            tid = self.next_id
+            self.next_id += 1
+            self.active[tid] = Track(tid, detections[det_idx], frame_idx)
+
+        # --- Stage 4: purge stale graveyard entries ---
+        expired = [
+            tid for tid, ls in self.graveyard_last_seen.items()
+            if (frame_idx - ls) > self.graveyard_age
+        ]
+        for tid in expired:
+            self.graveyard.pop(tid, None)
+            self.graveyard_last_seen.pop(tid, None)
+
+        # --- Collect confirmed output for this frame ---
+        confirmed_dets = []
+        new_records    = []
+
+        # Build a det lookup for confirmed tracks matched this frame
+        det_by_track: Dict[int, Detection] = {}
+        # Re-derive from history: any track whose last history entry is frame_idx
+        active_det_map: Dict[int, Detection] = {}
+        for det_idx, det in enumerate(detections):
+            pass  # we need to reverse-map track → det
+
+        # Simpler: iterate active tracks and find those updated this frame
+        for tid, track in self.active.items():
+            if track.status != CONFIRMED:
+                continue
+            if not track.history or track.history[-1][0] != frame_idx:
+                continue
+            # Find the matching detection by closest centroid
+            best_det = None
+            best_d   = float("inf")
+            for det in detections:
+                d = sqrt((det.x - track._pos[0]) ** 2 + (det.y - track._pos[1]) ** 2)
+                if d < best_d:
+                    best_d, best_det = d, det
+            if best_det is not None and best_d <= track.diameter:
+                confirmed_dets.append(best_det)
+
+            _, x, y, vx, vy = track.history[-1]
+            speed  = sqrt(vx ** 2 + vy ** 2)
+            gb_dist = (min_dist_to_grain_boundaries((x, y), grain_boundaries)
+                       if grain_boundaries else float("nan"))
+            record = {
+                "frame":         frame_idx,
+                "track_id":      tid,
+                "x":             round(x, 2),
+                "y":             round(y, 2),
+                "velocity":      round(speed, 4),
+                "diameter":      round(track.diameter, 2),
+                "area":          best_det.area if best_det else "",
+                "dist_to_gb_px": gb_dist,
+                "status":        track.status,
+            }
+            new_records.append(record)
+            self._records.append(record)
+
+        return confirmed_dets, new_records
+
+    def get_all_records(self) -> List[Dict]:
+        return list(self._records)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _hungarian_match(
+        self,
+        detections: List[Detection],
+        unmatched_indices: set,
+        pool: Dict[int, "Track"],
+    ) -> Tuple[Dict[int, int], set]:
+        """
+        Diameter-gated Hungarian matching.
+
+        Cost = distance / track.diameter  (normalised so gate = 1.0).
+        Cells where distance > diameter are set to inf.
+
+        Returns (det_idx → track_id, remaining_unmatched_indices).
+        """
+        if not pool or not unmatched_indices:
+            return {}, unmatched_indices
+
+        det_list  = [detections[i] for i in sorted(unmatched_indices)]
+        det_idx   = sorted(unmatched_indices)
+        tids      = list(pool.keys())
+        n_d, n_t  = len(det_list), len(tids)
+        INF       = 1e9
+        cost      = np.full((n_d, n_t), INF)
+
+        for i, det in enumerate(det_list):
+            for j, tid in enumerate(tids):
+                track = pool[tid]
+                px, py = track.predict_pos() if track.invisible_count > 0 else track._pos
+                dist   = sqrt((det.x - px) ** 2 + (det.y - py) ** 2)
+                diam   = max(track.diameter, 1.0)
+                if dist <= diam:
+                    cost[i, j] = dist / diam   # normalised cost in [0, 1]
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        matches:   Dict[int, int] = {}
+        still_unmatched = set(unmatched_indices)
+
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] < INF:
+                orig_det_idx    = det_idx[r]
+                matches[orig_det_idx] = tids[c]
+                still_unmatched.discard(orig_det_idx)
+
+        return matches, still_unmatched
+
+
+# ---------------------------------------------------------------------------
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _color_from_id(track_id: int) -> Tuple[int, int, int]:
@@ -130,288 +455,153 @@ def _extract_frame_index(path: Path, default_idx: int) -> int:
     return int(digits) if digits else default_idx
 
 
-def _find_components(
-    mask: np.ndarray,
-    fg_thresh_rel: float = FG_THRESH_REL,
-) -> Tuple[List[Dict], np.ndarray]:
-    """Watershed-based blob detection on a binary mask."""
-    fg = (mask > 128).astype(np.uint8)   # model output: bright = dislocation
-    if fg.max() == 0:
-        return [], np.zeros_like(fg, dtype=np.int32)
-
-    kernel  = np.ones((3, 3), np.uint8)
-    opened  = fg * 255
-    sure_bg = cv2.dilate(opened, kernel, iterations=BG_DILATE_ITER)
-
-    dist    = cv2.distanceTransform(opened, cv2.DIST_L2, 5)
-    max_d   = dist.max()
-    if max_d <= 0:
-        return [], np.zeros_like(fg, dtype=np.int32)
-
-    _, sure_fg = cv2.threshold(dist, fg_thresh_rel * max_d, 255, cv2.THRESH_BINARY)
-    sure_fg    = sure_fg.astype(np.uint8)
-    unknown    = cv2.subtract(sure_bg, sure_fg)
-
-    num_markers, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-
-    color = cv2.cvtColor(opened, cv2.COLOR_GRAY2BGR)
-    cv2.watershed(color, markers)
-    labels = markers
-    labels[labels == -1] = 0
-
-    comps: List[Dict] = []
-    for label_id in np.unique(labels):
-        if label_id <= 1:
-            continue
-        mask_label = (labels == label_id).astype(np.uint8)
-        area = int(mask_label.sum())
-        if area < MIN_AREA:
-            continue
-        cnts, _ = cv2.findContours(mask_label, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            continue
-        cnt = max(cnts, key=cv2.contourArea)
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter <= 0:
-            continue
-        roundness = float(4.0 * pi * area / (perimeter * perimeter))
-        if roundness < MIN_ROUNDNESS:
-            continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        roi = mask_label[y:y+bh, x:x+bw]
-        m   = cv2.moments(roi)
-        if m["m00"] == 0:
-            continue
-        cx = float(m["m10"] / m["m00"]) + x
-        cy = float(m["m01"] / m["m00"]) + y
-        comps.append({
-            "label":   int(label_id),
-            "centroid": (cx, cy),
-            "bbox":    (int(x), int(y), int(bw), int(bh)),
-            "area":    area,
-            "contour": cnt,
-        })
-
-    return comps, labels
-
-
-# ---------------------------------------------------------------------------
-# Tracker (Hungarian algorithm — copied from src/mask_tracker.py)
-# ---------------------------------------------------------------------------
-
-class SimpleTracker:
-    """
-    Hungarian-algorithm tracker with two-stage matching and a graveyard.
-
-    Stage 1 — match detections to *active* tracks (last seen within max_age frames).
-    Stage 2 — match remaining unmatched detections to *dead* tracks in the graveyard
-              (last seen within graveyard_age frames).  If a match is found the track
-              is revived with its original ID, preserving the full history.
-    Stage 3 — any detection still unmatched becomes a brand-new track.
-
-    Distance thresholds scale with the actual frame gap so skipped frames don't
-    cause spurious ID switches.
-    """
-
-    def __init__(
-        self,
-        max_distance:   float = MAX_DISTANCE,
-        max_age:        int   = MAX_AGE,
-        graveyard_age:  int   = GRAVEYARD_AGE,
-    ):
-        self.max_distance  = float(max_distance)
-        self.max_age       = int(max_age)
-        self.graveyard_age = int(graveyard_age)
-
-        # Active tracks
-        self.active:     Dict[int, Tuple[float, float]] = {}
-        self.last_seen:  Dict[int, int]                 = {}
-        self.history:    Dict[int, List]                = {}
-
-        # Dead tracks kept for possible revival
-        self.graveyard:          Dict[int, Tuple[float, float]] = {}
-        self.graveyard_last_seen: Dict[int, int]                = {}
-
-        self.next_id = 1
-
-    def _register(self, det: Dict, frame_idx: int) -> int:
-        tid = self.next_id
-        self.next_id += 1
-        self.active[tid]    = det["centroid"]
-        self.last_seen[tid] = frame_idx
-        self.history[tid]   = [(frame_idx, *det["centroid"])]
-        return tid
-
-    def _revive(self, tid: int, det: Dict, frame_idx: int) -> None:
-        """Move a graveyard track back to active."""
-        self.active[tid]    = det["centroid"]
-        self.last_seen[tid] = frame_idx
-        self.history[tid].append((frame_idx, *det["centroid"]))
-        self.graveyard.pop(tid, None)
-        self.graveyard_last_seen.pop(tid, None)
-
-    @staticmethod
-    def _match(
-        detections: List[Dict],
-        pool: Dict[int, Tuple[float, float]],
-        last_seen: Dict[int, int],
-        frame_idx: int,
-        max_distance: float,
-    ) -> Tuple[Dict[int, int], set]:
-        """
-        Run Hungarian matching between detections and a pool of tracks.
-        Returns (det_idx → track_id, set of matched det indices).
-        Distance threshold scales with frame gap.
-        """
-        from scipy.optimize import linear_sum_assignment
-
-        if not pool or not detections:
-            return {}, set()
-
-        tids     = list(pool.keys())
-        # Hard cap: dislocations barely move so we don't scale with frame gap.
-        # The graveyard handles temporal gaps; spatial tolerance stays fixed.
-        inf_dist = max_distance + 1.0
-        cost     = np.full((len(detections), len(tids)), inf_dist)
-
-        for i, det in enumerate(detections):
-            for j, tid in enumerate(tids):
-                cost[i, j] = float(np.hypot(
-                    det["centroid"][0] - pool[tid][0],
-                    det["centroid"][1] - pool[tid][1],
-                ))
-
-        row_ind, col_ind = linear_sum_assignment(cost)
-        matches:      Dict[int, int] = {}   # det_idx → track_id
-        matched_dets: set            = set()
-
-        for r, c in zip(row_ind, col_ind):
-            if cost[r, c] <= max_distance:
-                matches[r]     = tids[c]
-                matched_dets.add(r)
-
-        return matches, matched_dets
-
-    def update(self, detections: List[Dict], frame_idx: int) -> List[Dict]:
-        assigned:     List[Dict]   = []
-        matched_tids: set[int]     = set()
-
-        # --- Stage 1: match to active tracks ---
-        active_matches, matched_dets = self._match(
-            detections, self.active, self.last_seen, frame_idx, self.max_distance
-        )
-        for det_idx, tid in active_matches.items():
-            det = detections[det_idx]
-            self.active[tid]    = det["centroid"]
-            self.last_seen[tid] = frame_idx
-            self.history[tid].append((frame_idx, *det["centroid"]))
-            matched_tids.add(tid)
-            d = dict(det); d["track_id"] = tid
-            assigned.append(d)
-
-        unmatched = [i for i in range(len(detections)) if i not in matched_dets]
-
-        # --- Stage 2: try to revive graveyard tracks ---
-        if unmatched and self.graveyard:
-            unmatched_dets = [detections[i] for i in unmatched]
-            gy_matches, gy_matched = self._match(
-                unmatched_dets, self.graveyard, self.graveyard_last_seen,
-                frame_idx, self.max_distance
-            )
-            still_unmatched = []
-            for local_idx, orig_idx in enumerate(unmatched):
-                if local_idx in gy_matches:
-                    tid = gy_matches[local_idx]
-                    det = detections[orig_idx]
-                    self._revive(tid, det, frame_idx)
-                    matched_tids.add(tid)
-                    d = dict(det); d["track_id"] = tid
-                    assigned.append(d)
-                else:
-                    still_unmatched.append(orig_idx)
-            unmatched = still_unmatched
-
-        # --- Stage 3: new tracks for anything still unmatched ---
-        for orig_idx in unmatched:
-            det = detections[orig_idx]
-            d   = dict(det); d["track_id"] = self._register(det, frame_idx)
-            assigned.append(d)
-
-        # --- Age out active tracks → graveyard ---
-        for sid in set(self.active.keys()) - matched_tids:
-            frame_gap = frame_idx - self.last_seen.get(sid, frame_idx)
-            if frame_gap > self.max_age:
-                self.graveyard[sid]           = self.active.pop(sid)
-                self.graveyard_last_seen[sid] = self.last_seen.pop(sid)
-
-        # --- Expire graveyard entries that are too old to revive ---
-        expired = [
-            tid for tid, ls in self.graveyard_last_seen.items()
-            if (frame_idx - ls) > self.graveyard_age
-        ]
-        for tid in expired:
-            self.graveyard.pop(tid, None)
-            self.graveyard_last_seen.pop(tid, None)
-
-        return assigned
+def _loop_stats(frame_idx: int, detections: List[Detection]) -> Dict:
+    n = len(detections)
+    if n == 0:
+        return {"frame": frame_idx, "number_of_loops": 0,
+                "average_loop_size": 0.0, "average_diameter": 0.0}
+    areas     = np.array([d.area     for d in detections], dtype=np.float64)
+    diameters = np.array([d.diameter for d in detections], dtype=np.float64)
+    return {"frame": frame_idx, "number_of_loops": n,
+            "average_loop_size": float(areas.mean()),
+            "average_diameter":  float(diameters.mean())}
 
 
 # ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------
 
-def _draw_tracked(
-    labels: np.ndarray,
-    detections: List[Dict],
-    tracker: SimpleTracker,
-    frame_idx: int,
-) -> np.ndarray:
-    h, w  = labels.shape
-    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
-    for det in detections:
-        color = _color_from_id(det["track_id"])
-        canvas[labels == det["label"]] = color
-        cx, cy = det["centroid"]
-        cv2.putText(canvas, str(det["track_id"]),
-                    (int(cx) - 6, int(cy) + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
-    for tid, positions in tracker.history.items():
-        pts = [(int(x), int(y)) for f, x, y in positions if f <= frame_idx]
-        if len(pts) < 2:
-            continue
-        cv2.polylines(canvas, [np.array(pts, dtype=np.int32)],
-                      isClosed=False, color=_color_from_id(tid),
-                      thickness=1, lineType=cv2.LINE_AA)
-    return canvas
-
-
-def _draw_colorized(labels: np.ndarray, detections: List[Dict]) -> np.ndarray:
-    h, w   = labels.shape
-    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
-    for det in detections:
-        canvas[labels == det["label"]] = _color_from_id(det["track_id"])
-    return canvas
-
-
-def _draw_overlay(img_gray: np.ndarray, detections: List[Dict]) -> np.ndarray:
-    overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-    contours = [det["contour"] for det in detections]
+def _draw_overlay(img_gray: np.ndarray, detections: List[Detection]) -> np.ndarray:
+    overlay  = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+    contours = [d.contour for d in detections if len(d.contour) > 0]
     cv2.drawContours(overlay, contours, -1, (0, 255, 0), 1)
     return overlay
 
 
-def _loop_stats(frame_idx: int, detections: List[Dict]) -> Dict:
-    n = len(detections)
-    if n == 0:
-        return {"frame": frame_idx, "number_of_loops": 0,
-                "average_loop_size": 0.0, "average_diameter": 0.0}
-    areas     = np.array([d["area"] for d in detections], dtype=np.float64)
-    diameters = np.sqrt(4.0 * areas / pi)
-    return {"frame": frame_idx, "number_of_loops": n,
-            "average_loop_size": float(areas.mean()),
-            "average_diameter":  float(diameters.mean())}
+def _draw_tracked(
+    label_map:  np.ndarray,
+    detections: List[Detection],
+    tracker:    VideoTracker,
+    frame_idx:  int,
+) -> np.ndarray:
+    h, w   = label_map.shape
+    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
+    label_to_tid = {d.label: None for d in detections}
+
+    # Map detection labels to confirmed track IDs
+    for tid, track in tracker.active.items():
+        if track.status != CONFIRMED:
+            continue
+        for det in detections:
+            px, py = track._pos
+            if abs(det.x - px) < 2 and abs(det.y - py) < 2:
+                label_to_tid[det.label] = tid
+                break
+
+    for det in detections:
+        tid = label_to_tid.get(det.label)
+        if tid is None:
+            continue
+        color = _color_from_id(tid)
+        canvas[label_map == det.label] = color
+        cv2.putText(canvas, str(tid),
+                    (int(det.x) - 6, int(det.y) + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+
+    # Draw trajectory lines for all confirmed tracks
+    for tid, track in tracker.active.items():
+        if track.status != CONFIRMED:
+            continue
+        pts = [(int(x), int(y)) for f, x, y, vx, vy in track.history if f <= frame_idx]
+        if len(pts) >= 2:
+            cv2.polylines(canvas, [np.array(pts, dtype=np.int32)],
+                          isClosed=False, color=_color_from_id(tid),
+                          thickness=1, lineType=cv2.LINE_AA)
+    return canvas
+
+
+def _draw_colorized(label_map: np.ndarray, detections: List[Detection],
+                    tracker: VideoTracker) -> np.ndarray:
+    h, w   = label_map.shape
+    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
+    for det in detections:
+        # Find track ID for this detection
+        for tid, track in tracker.active.items():
+            if track.status != CONFIRMED:
+                continue
+            px, py = track._pos
+            if abs(det.x - px) < 2 and abs(det.y - py) < 2:
+                canvas[label_map == det.label] = _color_from_id(tid)
+                break
+    return canvas
+
+
+# ---------------------------------------------------------------------------
+# Per-track summary
+# ---------------------------------------------------------------------------
+
+def _build_track_summary(records: List[Dict]) -> List[Dict]:
+    """
+    Collapse the per-frame records into one summary row per track.
+
+    Columns:
+        track_id          — unique track identifier
+        first_frame       — frame index when the track was first confirmed
+        last_frame        — frame index of the last confirmed detection
+        track_lifespan    — last_frame - first_frame  (frames)
+        num_detections    — number of frames the track was detected
+        total_path_px     — sum of frame-to-frame distances (cumulative travel)
+        displacement_px   — straight-line distance from first to last position
+        mean_diameter_px  — mean equivalent circle diameter across all detections
+        mean_area_px2     — mean blob area in pixels²
+        mean_velocity_px  — mean per-frame speed
+        mean_dist_to_gb_px— mean distance to nearest grain boundary (nan if none)
+    """
+    if not records:
+        return []
+
+    from collections import defaultdict
+    grouped: Dict[int, List[Dict]] = defaultdict(list)
+    for r in records:
+        grouped[r["track_id"]].append(r)
+
+    summary = []
+    for tid, rows in sorted(grouped.items()):
+        rows = sorted(rows, key=lambda r: r["frame"])
+
+        frames     = [r["frame"]    for r in rows]
+        xs         = [r["x"]        for r in rows]
+        ys         = [r["y"]        for r in rows]
+        diameters  = [r["diameter"] for r in rows]
+        areas      = [r["area"]     for r in rows if r["area"] != ""]
+        velocities = [r["velocity"] for r in rows]
+        gb_dists   = [r["dist_to_gb_px"] for r in rows
+                      if not (isinstance(r["dist_to_gb_px"], float)
+                              and np.isnan(r["dist_to_gb_px"]))]
+
+        # Total path: sum of step distances
+        path = 0.0
+        for i in range(1, len(rows)):
+            path += sqrt((xs[i] - xs[i-1]) ** 2 + (ys[i] - ys[i-1]) ** 2)
+
+        # Straight-line displacement
+        displacement = sqrt((xs[-1] - xs[0]) ** 2 + (ys[-1] - ys[0]) ** 2)
+
+        summary.append({
+            "track_id":           tid,
+            "first_frame":        frames[0],
+            "last_frame":         frames[-1],
+            "track_lifespan":     frames[-1] - frames[0],
+            "num_detections":     len(rows),
+            "total_path_px":      round(path, 2),
+            "displacement_px":    round(displacement, 2),
+            "mean_diameter_px":   round(float(np.mean(diameters)), 2),
+            "mean_area_px2":      round(float(np.mean(areas)), 2) if areas else "",
+            "mean_velocity_px":   round(float(np.mean(velocities)), 4),
+            "mean_dist_to_gb_px": round(float(np.mean(gb_dists)), 2) if gb_dists else float("nan"),
+        })
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -419,16 +609,18 @@ def _loop_stats(frame_idx: int, detections: List[Dict]) -> Dict:
 # ---------------------------------------------------------------------------
 
 def run(
-    image_dir: Path,
-    out_dir: Path,
-    model: ResAttentionUNet,
-    device: str,
-    threshold: float = 0.5,
-    n_passes: int = 1,
+    image_dir:        Path,
+    out_dir:          Path,
+    model:            ResAttentionUNet,
+    device:           str,
+    threshold:        float = 0.5,
+    n_passes:         int   = 1,
     grain_boundaries: Optional[List] = None,
-    fg_thresh_rel: float = FG_THRESH_REL,
-    max_age: int = MAX_AGE,
-    graveyard_age: int = GRAVEYARD_AGE,
+    confirm_age:      int   = CONFIRM_AGE,
+    grace_period:     int   = GRACE_PERIOD,
+    graveyard_age:    int   = GRAVEYARD_AGE,
+    min_area:         int   = MIN_AREA,
+    min_roundness:    float = MIN_ROUNDNESS,
 ) -> None:
     image_paths = sorted(
         p for p in image_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS
@@ -437,7 +629,6 @@ def run(
         print(f"No images found in {image_dir}")
         return
 
-    # Output directories
     masks_dir    = out_dir / "masks"
     overlays_dir = out_dir / "overlays"
     tracks_dir   = out_dir / "tracks"
@@ -445,8 +636,9 @@ def run(
     for d in [masks_dir, overlays_dir, tracks_dir, color_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    tracker   = SimpleTracker(max_distance=MAX_DISTANCE, max_age=max_age, graveyard_age=graveyard_age)
-    csv_rows:  List[Dict] = []
+    extractor = CentroidExtractor(min_area=min_area, min_roundness=min_roundness)
+    tracker   = VideoTracker(confirm_age=confirm_age, grace_period=grace_period,
+                              graveyard_age=graveyard_age)
 
     loop_csv_path = out_dir / "loop_stats.csv"
     loop_file     = loop_csv_path.open("w", newline="")
@@ -464,64 +656,55 @@ def run(
             print(f"  Skipping unreadable file: {img_path.name}")
             continue
 
-        # 1. Model inference → binary mask
+        # 1. Inference
         binary_mask = predict_mask(model, img_gray, device,
                                    threshold=threshold, n_passes=n_passes)
 
-        # 2. Watershed component detection
-        detections, labels = _find_components(binary_mask, fg_thresh_rel=fg_thresh_rel)
+        # 2. Extract centroids + diameters from mask
+        detections, label_map = extractor.extract(binary_mask)
 
-        # 3. Tracking
-        detections = tracker.update(detections, frame_idx)
+        # 3. Track — returns only confirmed detections
+        confirmed_dets, _ = tracker.update(detections, frame_idx, grain_boundaries)
 
         stem = img_path.stem
+        cv2.imwrite(str(masks_dir    / f"{stem}_mask.png"),    binary_mask)
+        cv2.imwrite(str(overlays_dir / f"{stem}_overlay.png"), _draw_overlay(img_gray, confirmed_dets))
+        cv2.imwrite(str(tracks_dir   / f"{stem}_tracked.png"), _draw_tracked(label_map, confirmed_dets, tracker, frame_idx))
+        cv2.imwrite(str(color_dir    / f"{stem}_color.png"),   _draw_colorized(label_map, confirmed_dets, tracker))
 
-        # 4. Save outputs
-        cv2.imwrite(str(masks_dir    / f"{stem}_mask.png"),     binary_mask)
-        cv2.imwrite(str(overlays_dir / f"{stem}_overlay.png"),  _draw_overlay(img_gray, detections))
-        cv2.imwrite(str(tracks_dir   / f"{stem}_tracked.png"),  _draw_tracked(labels, detections, tracker, frame_idx))
-        cv2.imwrite(str(color_dir    / f"{stem}_color.png"),    _draw_colorized(labels, detections))
-
-        # 5. Accumulate CSV rows
-        for det in detections:
-            gb_dist = (min_dist_to_grain_boundaries(det["centroid"], grain_boundaries)
-                       if grain_boundaries else float("nan"))
-            csv_rows.append({
-                "frame":       frame_idx,
-                "track_id":    det["track_id"],
-                "area":        det["area"],
-                "bbox_x":      det["bbox"][0],
-                "bbox_y":      det["bbox"][1],
-                "bbox_w":      det["bbox"][2],
-                "bbox_h":      det["bbox"][3],
-                "centroid_x":  det["centroid"][0],
-                "centroid_y":  det["centroid"][1],
-                "dist_to_gb_px": gb_dist,
-            })
-        loop_writer.writerow(_loop_stats(frame_idx, detections))
+        loop_writer.writerow(_loop_stats(frame_idx, confirmed_dets))
         loop_file.flush()
 
-        n = len(detections)
-        print(f"  [{idx+1}/{len(image_paths)}] {img_path.name} — {n} dislocation(s) detected")
+        n_all       = len(detections)
+        n_confirmed = len(confirmed_dets)
+        n_active    = len(tracker.active)
+        print(f"  [{idx+1}/{len(image_paths)}] {img_path.name} — "
+              f"{n_all} detected, {n_confirmed} confirmed, {n_active} active tracks")
 
-    # 6. Write tracks CSV
+    # Write full per-detection tracks CSV (confirmed only)
     tracks_csv = out_dir / "tracks.csv"
-    with open(tracks_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "frame", "track_id", "area",
-            "bbox_x", "bbox_y", "bbox_w", "bbox_h",
-            "centroid_x", "centroid_y", "dist_to_gb_px",
-        ])
-        writer.writeheader()
-        writer.writerows(csv_rows)
+    records    = tracker.get_all_records()
+    if records:
+        with open(tracks_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(records[0].keys()))
+            writer.writeheader()
+            writer.writerows(records)
+
+    # Write per-track summary CSV
+    summary_csv = out_dir / "track_summary.csv"
+    summary_rows = _build_track_summary(records)
+    if summary_rows:
+        with open(summary_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(summary_rows)
 
     loop_file.close()
-    print(f"\nDone.")
-    print(f"  Masks     → {masks_dir}")
-    print(f"  Overlays  → {overlays_dir}")
-    print(f"  Tracks    → {tracks_dir}")
-    print(f"  tracks.csv    → {tracks_csv}")
-    print(f"  loop_stats.csv → {loop_csv_path}")
+    unique_ids = len(summary_rows)
+    print(f"\nDone.  {unique_ids} confirmed track(s) total.")
+    print(f"  tracks.csv       → {tracks_csv}")
+    print(f"  track_summary.csv→ {summary_csv}")
+    print(f"  loop_stats.csv   → {loop_csv_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -530,25 +713,29 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run trained model on a sequence of TEM images, track dislocations, output stats.",
+        description="Run trained model on TEM image sequence, track dislocations, output stats.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--image-dir", type=Path, required=True,
-                        help="Directory of TEM images to process (in frame order).")
-    parser.add_argument("--out-dir",   type=Path, default=Path("active_learning_data/tracking"),
-                        help="Output directory for masks, overlays, tracks, and CSVs.")
-    parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Probability threshold (0–1) for dislocation vs background.")
-    parser.add_argument("--passes",    type=int,   default=1,
-                        help="MC Dropout forward passes per patch (1 = fast, >1 = smoother).")
-    parser.add_argument("--gb-path",   type=Path,  default=None,
-                        help="Path to grain_boundaries.json for distance-to-boundary stats.")
-    parser.add_argument("--fg-thresh", type=float, default=FG_THRESH_REL,
-                        help="Watershed foreground threshold (fraction of max distance transform).")
-    parser.add_argument("--max-age",      type=int, default=MAX_AGE,
-                        help="Frames before an unmatched track is moved to the graveyard.")
-    parser.add_argument("--graveyard-age", type=int, default=GRAVEYARD_AGE,
-                        help="Frames a dead track stays revivable in the graveyard.")
+    parser.add_argument("--image-dir",     type=Path,
+                        default=Path("active_learning_data/raw_data"),
+                        help="Directory of input images (default: active_learning_data/raw_data).")
+    parser.add_argument("--out-dir",       type=Path,  default=Path("active_learning_data/tracking"))
+    parser.add_argument("--threshold",     type=float, default=0.5,
+                        help="Probability threshold for dislocation vs background.")
+    parser.add_argument("--passes",        type=int,   default=1,
+                        help="MC Dropout passes per patch (1=fast, >1=smoother).")
+    parser.add_argument("--gb-path",       type=Path,  default=None,
+                        help="Path to grain_boundaries.json.")
+    parser.add_argument("--confirm-age",   type=int,   default=CONFIRM_AGE,
+                        help="Consecutive hits before a track is confirmed.")
+    parser.add_argument("--grace-period",  type=int,   default=GRACE_PERIOD,
+                        help="Invisible frames kept alive with velocity prediction.")
+    parser.add_argument("--graveyard-age", type=int,   default=GRAVEYARD_AGE,
+                        help="Frames a dead track stays revivable.")
+    parser.add_argument("--min-area",      type=int,   default=MIN_AREA,
+                        help="Minimum blob area in pixels.")
+    parser.add_argument("--min-roundness", type=float, default=MIN_ROUNDNESS,
+                        help="Minimum roundness (0–1) to accept a blob.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -560,7 +747,7 @@ def main() -> None:
         with open(gb_path) as f:
             data = json.load(f)
             grain_boundaries = [((p[0][0], p[0][1]), (p[1][0], p[1][1])) for p in data]
-        print(f"Loaded {len(grain_boundaries)} grain boundary segment(s) from {gb_path}")
+        print(f"Loaded {len(grain_boundaries)} grain boundary segment(s).")
 
     run(
         image_dir        = args.image_dir,
@@ -570,9 +757,11 @@ def main() -> None:
         threshold        = args.threshold,
         n_passes         = args.passes,
         grain_boundaries = grain_boundaries,
-        fg_thresh_rel    = args.fg_thresh,
-        max_age          = args.max_age,
+        confirm_age      = args.confirm_age,
+        grace_period     = args.grace_period,
         graveyard_age    = args.graveyard_age,
+        min_area         = args.min_area,
+        min_roundness    = args.min_roundness,
     )
 
 
